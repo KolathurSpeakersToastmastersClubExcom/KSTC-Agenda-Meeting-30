@@ -1,0 +1,1449 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KSTC Meeting #30 - Google vs Real Life</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Fire Particles */
+        .fire-particle {
+            position: fixed;
+            width: 10px;
+            height: 10px;
+            background: radial-gradient(circle, #ff6b35, #f7931e);
+            border-radius: 50%;
+            pointer-events: none;
+            animation: float 5s infinite;
+            box-shadow: 0 0 15px #ff6b35, 0 0 30px #f7931e;
+            z-index: 1;
+        }
+
+        @keyframes float {
+            0% {
+                transform: translateY(100vh) translateX(0) scale(0) rotate(0deg);
+                opacity: 0;
+            }
+            10% {
+                opacity: 1;
+            }
+            90% {
+                opacity: 0.8;
+            }
+            100% {
+                transform: translateY(-100px) translateX(var(--drift)) scale(1.5) rotate(360deg);
+                opacity: 0;
+            }
+        }
+
+        /* Bursting Fire Bubbles */
+        .fire-burst {
+            position: fixed;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 9999;
+            animation: burst 2s ease-out forwards;
+        }
+
+        @keyframes burst {
+            0% {
+                transform: translate(-50%, -50%) scale(0);
+                opacity: 1;
+            }
+            50% {
+                opacity: 1;
+            }
+            100% {
+                transform: translate(var(--x), var(--y)) scale(0);
+                opacity: 0;
+            }
+        }
+
+        .fire-bubble {
+            position: fixed;
+            border-radius: 50%;
+            pointer-events: none;
+            z-index: 9998;
+            animation: bubble 3s ease-out forwards;
+            box-shadow: 0 0 20px currentColor, inset 0 0 10px rgba(255, 255, 255, 0.5);
+        }
+
+        @keyframes bubble {
+            0% {
+                transform: translate(-50%, -50%) scale(0);
+                opacity: 0;
+            }
+            20% {
+                opacity: 1;
+            }
+            100% {
+                transform: translate(var(--bx), var(--by)) scale(1.5);
+                opacity: 0;
+            }
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            padding: 30px 20px;
+            box-shadow: 0 5px 20px rgba(0, 0, 0, 0.3);
+            position: relative;
+            z-index: 10;
+        }
+
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .logo {
+            width: 90px;
+            height: 90px;
+            background: white;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            animation: pulse 2s infinite;
+            overflow: hidden;
+            padding: 5px;
+        }
+
+        .logo img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+        }
+
+        .club-info h1 {
+            color: white;
+            font-size: 2em;
+            margin-bottom: 5px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .club-info p {
+            color: #ffd89b;
+            font-size: 1.1em;
+        }
+
+        .header-meta {
+            text-align: right;
+            color: white;
+        }
+
+        .meeting-number {
+            font-size: 2.5em;
+            font-weight: bold;
+            background: linear-gradient(45deg, #ff6b35, #f7931e);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .meeting-date {
+            font-size: 1.2em;
+            margin-top: 5px;
+        }
+
+        /* Main Container */
+        .container {
+            max-width: 1200px;
+            margin: 40px auto;
+            background: rgba(255, 255, 255, 0.98);
+            border-radius: 20px;
+            padding: 50px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            position: relative;
+            z-index: 10;
+        }
+
+        /* Hero Section */
+        .hero {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 30px;
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            border-radius: 15px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '🔥';
+            position: absolute;
+            font-size: 5em;
+            opacity: 0.1;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) rotate(-15deg);
+        }
+
+        /* Rocket animations */
+        .rocket {
+            position: absolute;
+            font-size: 2em;
+            animation: rocketFly 3s ease-out forwards;
+            pointer-events: none;
+            z-index: 100;
+        }
+
+        @keyframes rocketFly {
+            0% {
+                transform: translate(0, 0) rotate(45deg);
+                opacity: 1;
+            }
+            70% {
+                opacity: 1;
+            }
+            100% {
+                transform: translate(var(--tx), var(--ty)) rotate(45deg);
+                opacity: 0;
+            }
+        }
+
+        .rocket-trail {
+            position: absolute;
+            width: 4px;
+            height: 20px;
+            border-radius: 2px;
+            animation: trail 0.5s ease-out forwards;
+            pointer-events: none;
+            z-index: 99;
+        }
+
+        @keyframes trail {
+            0% {
+                opacity: 0.8;
+                transform: scaleY(1);
+            }
+            100% {
+                opacity: 0;
+                transform: scaleY(0);
+            }
+        }
+
+        .rocket-burst {
+            position: absolute;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            animation: burstOut 1.5s ease-out forwards;
+            pointer-events: none;
+            z-index: 101;
+            box-shadow: 0 0 10px currentColor;
+        }
+
+        @keyframes burstOut {
+            0% {
+                transform: translate(0, 0) scale(1);
+                opacity: 1;
+            }
+            100% {
+                transform: translate(var(--bx), var(--by)) scale(0);
+                opacity: 0;
+            }
+        }
+
+        .theme-title {
+            font-size: 3.5em;
+            font-weight: bold;
+            background: linear-gradient(45deg, #667eea, #764ba2, #667eea);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 10px;
+            animation: shimmer 3s infinite, shake 4s infinite;
+            background-size: 200% 100%;
+            position: relative;
+            z-index: 1;
+            cursor: pointer;
+        }
+
+        .theme-title::before {
+            content: attr(data-text);
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(45deg, #667eea, #764ba2, #667eea);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: ripple 3s infinite;
+            opacity: 0.5;
+            z-index: -1;
+        }
+
+        @keyframes shimmer {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        @keyframes shake {
+            0%, 100% { transform: translateX(0) rotate(0deg); }
+            10%, 30%, 50%, 70%, 90% { transform: translateX(-2px) rotate(-0.5deg); }
+            20%, 40%, 60%, 80% { transform: translateX(2px) rotate(0.5deg); }
+        }
+
+        @keyframes ripple {
+            0% {
+                transform: scale(1);
+                opacity: 0.5;
+            }
+            50% {
+                transform: scale(1.05);
+                opacity: 0.3;
+            }
+            100% {
+                transform: scale(1.1);
+                opacity: 0;
+            }
+        }
+
+        .theme-title:hover {
+            animation: shimmer 3s infinite, shake 0.5s infinite;
+        }
+
+        .theme-subtitle {
+            font-size: 1.3em;
+            color: #555;
+            font-style: italic;
+        }
+
+        /* Word of the Day */
+        .word-section {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            padding: 25px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            border-left: 6px solid #ff6b35;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        .word-section h2 {
+            color: #667eea;
+            font-size: 2em;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .catalyst-word {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #ff6b35;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.2);
+            margin: 10px 0;
+        }
+
+        /* Executive Committee */
+        .executives-section {
+            margin-bottom: 40px;
+        }
+
+        .section-title {
+            font-size: 2.2em;
+            color: #667eea;
+            margin-bottom: 20px;
+            text-align: center;
+            position: relative;
+            padding-bottom: 15px;
+        }
+
+        .section-title::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 100px;
+            height: 4px;
+            background: linear-gradient(90deg, #ff6b35, #f7931e);
+            border-radius: 2px;
+        }
+
+        .executives-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .exec-card {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .exec-card::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            right: -50%;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle, rgba(255, 255, 255, 0.3), transparent);
+            transform: rotate(45deg);
+        }
+
+        .exec-card:hover {
+            transform: translateY(-8px) scale(1.03);
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.25);
+        }
+
+        .exec-title {
+            font-weight: bold;
+            color: white;
+            font-size: 1em;
+            margin-bottom: 8px;
+            text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.3);
+        }
+
+        .exec-name {
+            color: #fff;
+            font-size: 1.3em;
+            font-weight: bold;
+            text-shadow: 3px 3px 6px rgba(0, 0, 0, 0.5),
+                         -1px -1px 2px rgba(255, 255, 255, 0.3),
+                         0 0 10px rgba(255, 255, 255, 0.2);
+            transform: perspective(500px) rotateX(5deg);
+            display: inline-block;
+            position: relative;
+            z-index: 1;
+        }
+
+        /* Agenda Timeline */
+        .timeline-section {
+            margin-bottom: 40px;
+        }
+
+        .agenda-item {
+            background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+            padding: 20px;
+            margin-bottom: 15px;
+            border-radius: 12px;
+            border-left: 5px solid #ff6b35;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .agenda-item::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.5), transparent);
+            transition: left 0.6s;
+        }
+
+        .agenda-item:hover {
+            transform: translateX(12px);
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        .agenda-item:hover::before {
+            left: 100%;
+        }
+
+        .time-badge {
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 8px 18px;
+            border-radius: 25px;
+            font-weight: bold;
+            margin-right: 15px;
+            box-shadow: 0 3px 8px rgba(0, 0, 0, 0.2);
+            font-size: 1.1em;
+        }
+
+        .role-name {
+            color: #333;
+            font-weight: bold;
+            text-shadow: 2px 2px 4px rgba(102, 126, 234, 0.3),
+                         -1px -1px 2px rgba(255, 255, 255, 0.5);
+            transform: perspective(300px) rotateY(-3deg);
+            display: inline-block;
+        }
+
+        /* Speaker Cards */
+        .speakers-section {
+            margin-bottom: 40px;
+        }
+
+        .speaker-card {
+            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%);
+            padding: 25px;
+            margin-bottom: 20px;
+            border-radius: 15px;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+            border-left: 6px solid #f7931e;
+            transition: all 0.3s ease;
+        }
+
+        .speaker-card:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+
+        .speaker-name {
+            font-size: 1.6em;
+            font-weight: bold;
+            color: #333;
+            text-shadow: 3px 3px 6px rgba(255, 107, 53, 0.4),
+                         -1px -1px 3px rgba(255, 255, 255, 0.6);
+            transform: perspective(400px) rotateY(-5deg);
+            display: inline-block;
+            margin-bottom: 10px;
+        }
+
+        .speech-title {
+            font-style: italic;
+            color: #555;
+            margin-top: 8px;
+            font-weight: bold;
+            font-size: 1.2em;
+        }
+
+        .pathway-info {
+            color: #666;
+            font-size: 0.95em;
+            margin-top: 5px;
+        }
+
+        /* Educational Session */
+        .education-card {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            padding: 30px;
+            border-radius: 15px;
+            margin-bottom: 25px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15);
+            border: 3px solid #ff6b35;
+        }
+
+        .education-card h3 {
+            color: white;
+            font-size: 1.8em;
+            margin-bottom: 15px;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        /* TAG Team */
+        .tag-team {
+            background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
+            padding: 25px;
+            border-radius: 15px;
+            margin: 30px 0;
+            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.15);
+        }
+
+        .tag-team h3 {
+            color: white;
+            margin-bottom: 15px;
+            font-size: 1.8em;
+            text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3);
+        }
+
+        .tag-member {
+            display: inline-block;
+            background: white;
+            padding: 12px 20px;
+            border-radius: 25px;
+            margin: 8px;
+            box-shadow: 0 3px 8px rgba(0, 0, 0, 0.15);
+            font-weight: bold;
+            color: #333;
+            transition: all 0.3s ease;
+        }
+
+        .tag-member:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.25);
+        }
+
+        /* Footer */
+        .footer {
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            padding: 40px 20px;
+            margin-top: 60px;
+            position: relative;
+            z-index: 10;
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            text-align: center;
+        }
+
+        .footer-title {
+            font-size: 2em;
+            margin-bottom: 20px;
+            font-weight: bold;
+            background: linear-gradient(45deg, #ffd89b, #ff6b35);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .footer-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 30px;
+            margin-top: 30px;
+        }
+
+        .footer-section h4 {
+            color: #ffd89b;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+        }
+
+        .footer-section p {
+            line-height: 1.8;
+            font-size: 1.05em;
+        }
+
+        .social-links {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 30px;
+        }
+
+        .social-icon {
+            width: 50px;
+            height: 50px;
+            background: linear-gradient(135deg, #ffd89b 0%, #ff6b35 100%);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5em;
+            transition: all 0.3s ease;
+            cursor: pointer;
+        }
+
+        .social-icon:hover {
+            transform: scale(1.2) rotate(360deg);
+            box-shadow: 0 5px 15px rgba(255, 107, 53, 0.5);
+        }
+
+        .copyright {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 2px solid rgba(255, 255, 255, 0.2);
+            font-size: 1.1em;
+        }
+
+        /* Call to Action */
+        .cta-section {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 30px;
+            border-radius: 15px;
+            text-align: center;
+            margin: 30px 0;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+        }
+
+        .cta-section h3 {
+            color: white;
+            font-size: 2em;
+            margin-bottom: 15px;
+        }
+
+        .cta-section p {
+            color: #ffd89b;
+            font-size: 1.2em;
+        }
+
+        @media (max-width: 768px) {
+            .header-content {
+                flex-direction: column;
+                text-align: center;
+            }
+
+            .header-meta {
+                text-align: center;
+            }
+
+            .theme-title {
+                font-size: 2.5em;
+            }
+
+            .container {
+                padding: 30px 20px;
+                margin: 20px;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <!-- Header -->
+    <div class="header">
+        <div class="header-content">
+            <div class="logo-section">
+                <div class="club-info">
+                    <h1>Kolathur Speakers Toastmasters Club</h1>
+                    <p>Where Leaders Are Made</p>
+                </div>
+            </div>
+            <div class="header-meta">
+                <div class="meeting-number">Meeting #30</div>
+                <div class="meeting-date">📅 14th December, 2025 | ⏰ 10:30 AM</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="container">
+        <!-- Hero Section -->
+        <div class="hero">
+            <div class="theme-title" data-text="Google vs Real Life">Google vs Real Life</div>
+            <div class="theme-subtitle">Exploring the intersection of digital wisdom and lived experience</div>
+        </div>
+
+        <!-- Word of the Day -->
+        <div class="word-section">
+            <h2>💡 Word of the Day</h2>
+            <div class="catalyst-word">CATALYST</div>
+            <p><strong>Meaning:</strong> A person, thing, or event that sparks change, accelerates progress, or inspires action.</p>
+            <p style="margin-top: 10px;"><strong>Example:</strong> Joining Toastmasters became a catalyst for my communication growth, or a single encouraging word can be the catalyst someone needs to take action.</p>
+        </div>
+
+        <!-- Meeting Agenda -->
+        <div class="timeline-section">
+            <h2 class="section-title">📋 Meeting Agenda</h2>
+            
+            <div class="agenda-item">
+                <span class="time-badge">10:30 AM</span>
+                <strong>Meeting Call to Order</strong> - <span class="role-name">TM Prashanth</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">10:32 AM</span>
+                <strong>Opening &amp; Guest Introductions</strong> - <span class="role-name">TM Rajesh</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">10:37 AM</span>
+                <strong>Theme Introduction</strong> - <span class="role-name">TM Heroji</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">10:40 AM</span>
+                <strong>TAG Team Introduction</strong> - <span class="role-name">TM Rajesh</span>
+            </div>
+        </div>
+
+        <!-- Prepared Speeches -->
+        <div class="speakers-section">
+            <h2 class="section-title">🎤 Prepared Speeches</h2>
+            
+            <div class="speaker-card">
+                <div class="speaker-name">🔥 Speaker 1: TM Sirisha</div>
+                <p><strong>Time:</strong> 10:47 AM | <strong>Duration:</strong> 5-7 minutes</p>
+                <p class="pathway-info"><strong>Pathway:</strong> Persuasive Influence - Level 1 | Project: Speech with a purpose</p>
+                <p class="speech-title">📢 "Convincing the Toughest Audience – Me"</p>
+                <p style="margin-top: 10px;"><strong>Evaluator:</strong> <span class="role-name">TM Dheenadayalan</span></p>
+            </div>
+
+            <div class="speaker-card">
+                <div class="speaker-name">🔥 Speaker 2: TM Sumathi</div>
+                <p><strong>Time:</strong> 10:54 AM | <strong>Duration:</strong> 5-7 minutes</p>
+                <p class="pathway-info"><strong>Pathway:</strong> Dynamic Leadership - Level 1 | Project: Speech with a purpose</p>
+                <p class="speech-title">📢 "Managing Self"</p>
+                <p style="margin-top: 10px;"><strong>Evaluator:</strong> <span class="role-name">TM Praveen / TM Rajesh</span></p>
+            </div>
+        </div>
+
+        <!-- Educational Session -->
+        <div class="education-card">
+            <h3>📚 Educational Session (11:01 AM - 20 minutes)</h3>
+            <div class="speaker-name">Presenter: TM Priya Damodaran</div>
+            <p style="color: white; font-size: 1.2em; margin-top: 10px; font-weight: bold;">
+                Topic: "How to Write Scripts for Prepared Speeches - Especially ISC"
+            </p>
+        </div>
+
+        <!-- Interactive Sessions -->
+        <div class="timeline-section">
+            <h2 class="section-title">🎯 Interactive Sessions</h2>
+            
+            <div class="agenda-item">
+                <span class="time-badge">11:24 AM</span>
+                <strong>Table Topics Session (12 mins)</strong> - <span class="role-name">TM Praveen</span>
+            </div>
+        </div>
+
+        <!-- Evaluation Sessions -->
+        <div class="timeline-section">
+            <h2 class="section-title">📊 Evaluation Session</h2>
+            
+            <div class="agenda-item">
+                <span class="time-badge">11:39 AM</span>
+                <strong>Speech Evaluation 1</strong> - <span class="role-name">TM Dheenadayalan</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">11:42 AM</span>
+                <strong>Speech Evaluation 2</strong> - <span class="role-name">TM Praveen</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">11:45 AM</span>
+                <strong>Evaluate the Evaluation</strong> - <span class="role-name">TM Rajesh</span>
+            </div>
+        </div>
+
+        <!-- TAG Team -->
+        <div class="tag-team">
+            <h3>⏱️ TAG Team Report (11:48 AM)</h3>
+            <span class="tag-member">⏲️ Timer: TM Vijay</span>
+            <span class="tag-member">🔔 Ah Counter: TM Devika</span>
+            <span class="tag-member">📝 Grammarian: TM Ravishankar</span>
+        </div>
+
+        <!-- Closing Sessions -->
+        <div class="timeline-section">
+            <h2 class="section-title">🏆 Closing Ceremony</h2>
+            
+            <div class="agenda-item">
+                <span class="time-badge">11:55 AM</span>
+                <strong>General Evaluator Remarks</strong> - <span class="role-name">TM Rajesh</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">12:00 PM</span>
+                <strong>Theme Wrap-up</strong> - <span class="role-name">TM Heroji</span>
+            </div>
+
+            <div class="agenda-item">
+                <span class="time-badge">12:02 PM</span>
+                <strong>🎊 Awards &amp; Closing Remarks</strong> - <span class="role-name">TM Rajesh</span>
+            </div>
+        </div>
+
+        <!-- CTA Section -->
+        <div class="cta-section">
+            <h3>✨ First Time Role Players Recognition ✨</h3>
+            <p>Join us for a photo session and networking at 12:07 PM</p>
+        </div>
+
+        <!-- Executive Committee -->
+        <div class="executives-section">
+            <h2 class="section-title">👔 Club Executive Committee</h2>
+            <div class="executives-grid">
+                <div class="exec-card">
+                    <div class="exec-title">Club President</div>
+                    <div class="exec-name">TM Rajesh</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">VP Membership</div>
+                    <div class="exec-name">TM Dheenadayalan</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">VP Education</div>
+                    <div class="exec-name">TM Yogesh</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">VP Public Relations</div>
+                    <div class="exec-name">TM Saranya</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">Secretary</div>
+                    <div class="exec-name">TM Sabarish</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">Treasurer</div>
+                    <div class="exec-name">TM Ravishankar</div>
+                </div>
+                <div class="exec-card">
+                    <div class="exec-title">Sergeant At Arms</div>
+                    <div class="exec-name">TM Pradeep</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+        <div class="footer-content">
+            <div class="footer-title">🎤 Kolathur Speakers Toastmasters Club</div>
+            
+            <div class="footer-info">
+                <div class="footer-section">
+                    <h4>Our Mission</h4>
+                    <p>We provide a supportive and positive learning experience in which members are empowered to develop communication and leadership skills.</p>
+                </div>
+                
+                <div class="footer-section">
+                    <h4>Meeting Details</h4>
+                    <p>📍 Exemplary Solutions<br>
+                    Plot No 2, S.No. 91/3<br>
+                    Surapet Main Road, Puthagaram<br>
+                    Vinayagapuram, Chennai - 600099<br>
+                    ⏰ Every Sunday at 10:30 AM</p>
+                </div>
+                
+                <div class="footer-section">
+                    <h4>Join Us</h4>
+                    <p>Interested in becoming a member?<br>
+                    Visit us at our next meeting or contact us to learn more about membership opportunities.</p>
+                </div>
+            </div>
+
+            <div class="social-links">
+                <div class="social-icon">📘</div>
+                <div class="social-icon">🐦</div>
+                <div class="social-icon">📷</div>
+                <div class="social-icon">💼</div>
+            </div>
+
+            <div class="copyright">
+                <p>© 2025 KSTC Toastmasters Club. All rights reserved.</p>
+                <p style="margin-top: 10px; font-size: 0.95em;">Empowering speakers, building leaders, transforming lives.</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Create fire particles with enhanced effects
+        function createFireParticle() {
+            const particle = document.createElement('div');
+            particle.className = 'fire-particle';
+            particle.style.left = Math.random() * 100 + '%';
+            particle.style.setProperty('--drift', (Math.random() - 0.5) * 300 + 'px');
+            particle.style.animationDelay = Math.random() * 3 + 's';
+            particle.style.animationDuration = (4 + Math.random() * 2) + 's';
+            
+            // Random colors for variety
+            const colors = [
+                'radial-gradient(circle, #ff6b35, #f7931e)',
+                'radial-gradient(circle, #f7931e, #ffbe0b)',
+                'radial-gradient(circle, #ff006e, #ff5e00)'
+            ];
+            particle.style.background = colors[Math.floor(Math.random() * colors.length)];
+            
+            document.body.appendChild(particle);
+
+            setTimeout(() => {
+                particle.remove();
+            }, 6000);
+        }
+
+        // Create particles continuously
+        setInterval(createFireParticle, 150);
+
+        // Create initial burst
+        for (let i = 0; i < 30; i++) {
+            setTimeout(createFireParticle, i * 80);
+        }
+
+        // Create bursting fire bubbles in the middle
+        function createBurstEffect() {
+            const container = document.querySelector('.container');
+            const rect = container.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+
+            const colors = [
+                '#ff6b35', '#f7931e', '#ffbe0b', '#ff006e', 
+                '#ff5e00', '#fb5607', '#ff9500', '#ff3d00'
+            ];
+
+            // Create multiple bursts
+            for (let i = 0; i < 12; i++) {
+                const angle = (i * 30) * (Math.PI / 180);
+                const distance = 100 + Math.random() * 150;
+                const bubble = document.createElement('div');
+                bubble.className = 'fire-bubble';
+                
+                const size = 15 + Math.random() * 25;
+                bubble.style.width = size + 'px';
+                bubble.style.height = size + 'px';
+                bubble.style.left = centerX + 'px';
+                bubble.style.top = centerY + 'px';
+                bubble.style.background = colors[Math.floor(Math.random() * colors.length)];
+                
+                const endX = Math.cos(angle) * distance;
+                const endY = Math.sin(angle) * distance;
+                bubble.style.setProperty('--bx', endX + 'px');
+                bubble.style.setProperty('--by', endY + 'px');
+                bubble.style.animationDelay = (Math.random() * 0.3) + 's';
+                
+                document.body.appendChild(bubble);
+                
+                setTimeout(() => bubble.remove(), 3500);
+            }
+
+            // Add small sparks
+            for (let i = 0; i < 20; i++) {
+                const spark = document.createElement('div');
+                spark.className = 'fire-burst';
+                spark.style.left = centerX + 'px';
+                spark.style.top = centerY + 'px';
+                spark.style.background = colors[Math.floor(Math.random() * colors.length)];
+                spark.style.width = (5 + Math.random() * 10) + 'px';
+                spark.style.height = spark.style.width;
+                
+                const sparkX = (Math.random() - 0.5) * 300;
+                const sparkY = (Math.random() - 0.5) * 300;
+                spark.style.setProperty('--x', sparkX + 'px');
+                spark.style.setProperty('--y', sparkY + 'px');
+                spark.style.animationDelay = (Math.random() * 0.2) + 's';
+                
+                document.body.appendChild(spark);
+                
+                setTimeout(() => spark.remove(), 2500);
+            }
+        }
+
+        // Create burst effect every 4 seconds
+        setInterval(createBurstEffect, 4000);
+        
+        // Initial burst after page load
+        setTimeout(createBurstEffect, 1000);
+
+        // Rocket effects in hero section
+        function createRocketEffect() {
+            const hero = document.querySelector('.hero');
+            if (!hero) return;
+            
+            const rect = hero.getBoundingClientRect();
+            const colors = [
+                '#ff6b35', '#f7931e', '#ffbe0b', '#ff006e', 
+                '#ff5e00', '#fb5607', '#ff9500', '#ff3d00',
+                '#00f5ff', '#ff00ff', '#00ff00', '#ffff00'
+            ];
+
+            // Create rocket
+            const rocket = document.createElement('div');
+            rocket.className = 'rocket';
+            rocket.textContent = '🚀';
+            
+            // Random starting position at bottom of hero
+            const startX = rect.left + Math.random() * rect.width;
+            const startY = rect.bottom - 20;
+            
+            rocket.style.left = startX + 'px';
+            rocket.style.top = startY + 'px';
+            
+            // Random trajectory
+            const endX = (Math.random() - 0.5) * 300;
+            const endY = -200 - Math.random() * 200;
+            rocket.style.setProperty('--tx', endX + 'px');
+            rocket.style.setProperty('--ty', endY + 'px');
+            
+            document.body.appendChild(rocket);
+
+            // Create trail effect
+            let trailCount = 0;
+            const trailInterval = setInterval(() => {
+                if (trailCount > 15) {
+                    clearInterval(trailInterval);
+                    return;
+                }
+                
+                const trail = document.createElement('div');
+                trail.className = 'rocket-trail';
+                trail.style.left = startX + (endX * trailCount / 20) + 'px';
+                trail.style.top = startY + (endY * trailCount / 20) + 'px';
+                trail.style.background = colors[Math.floor(Math.random() * colors.length)];
+                document.body.appendChild(trail);
+                
+                setTimeout(() => trail.remove(), 500);
+                trailCount++;
+            }, 100);
+
+            // Create burst at the end
+            setTimeout(() => {
+                const burstX = startX + endX;
+                const burstY = startY + endY;
+                
+                // Create multiple burst particles
+                for (let i = 0; i < 15; i++) {
+                    const burst = document.createElement('div');
+                    burst.className = 'rocket-burst';
+                    burst.style.left = burstX + 'px';
+                    burst.style.top = burstY + 'px';
+                    burst.style.background = colors[Math.floor(Math.random() * colors.length)];
+                    
+                    const angle = (i * 24) * (Math.PI / 180);
+                    const distance = 50 + Math.random() * 80;
+                    burst.style.setProperty('--bx', Math.cos(angle) * distance + 'px');
+                    burst.style.setProperty('--by', Math.sin(angle) * distance + 'px');
+                    
+                    document.body.appendChild(burst);
+                    setTimeout(() => burst.remove(), 1500);
+                }
+                
+                // Add sparkles
+                for (let i = 0; i < 8; i++) {
+                    const sparkle = document.createElement('div');
+                    sparkle.className = 'fire-burst';
+                    sparkle.style.left = burstX + 'px';
+                    sparkle.style.top = burstY + 'px';
+                    sparkle.style.background = colors[Math.floor(Math.random() * colors.length)];
+                    sparkle.style.width = '6px';
+                    sparkle.style.height = '6px';
+                    
+                    const sx = (Math.random() - 0.5) * 150;
+                    const sy = (Math.random() - 0.5) * 150;
+                    sparkle.style.setProperty('--x', sx + 'px');
+                    sparkle.style.setProperty('--y', sy + 'px');
+                    
+                    document.body.appendChild(sparkle);
+                    setTimeout(() => sparkle.remove(), 2000);
+                }
+            }, 2100);
+
+            setTimeout(() => rocket.remove(), 3000);
+        }
+
+        // Launch rockets periodically
+        setInterval(createRocketEffect, 2500);
+        setTimeout(createRocketEffect, 500);
+        setTimeout(createRocketEffect, 1500);
+
+        // Add sparkle effect on scroll
+        window.addEventListener('scroll', () => {
+            if (Math.random() > 0.8) {
+                createFireParticle();
+            }
+        });
+    </script>
+
+<div class="fire-particle" style="left: 57.5602%; --drift: 54.165486238724014px; animation-delay: 0.236429s; animation-duration: 4.16501s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 16.8184%; --drift: -71.61639823990564px; animation-delay: 0.577791s; animation-duration: 4.82228s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 43.0285%; --drift: -131.27761499399813px; animation-delay: 0.411556s; animation-duration: 5.38668s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 20.0664%; --drift: 32.443338983919844px; animation-delay: 0.811461s; animation-duration: 4.26323s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 2.86916%; --drift: 125.59753180813463px; animation-delay: 1.85697s; animation-duration: 4.70991s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 50.0758%; --drift: 35.81901752927854px; animation-delay: 1.36132s; animation-duration: 5.1429s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 91.9149%; --drift: -125.87203568789039px; animation-delay: 0.382997s; animation-duration: 4.77767s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 83.2995%; --drift: -8.26783730753421px; animation-delay: 0.392004s; animation-duration: 4.16421s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 50.9704%; --drift: -120.99150642234765px; animation-delay: 1.1491s; animation-duration: 4.2154s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 47.451%; --drift: 131.88041235967788px; animation-delay: 1.40008s; animation-duration: 5.53669s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 74.5815%; --drift: -37.692615102223684px; animation-delay: 1.71469s; animation-duration: 5.33312s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 97.428%; --drift: 134.0102835377828px; animation-delay: 0.947644s; animation-duration: 5.53812s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 94.1256%; --drift: 19.00758772987442px; animation-delay: 1.61526s; animation-duration: 5.34948s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 50.2296%; --drift: -69.5967442109102px; animation-delay: 0.77926s; animation-duration: 5.77172s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 67.0919%; --drift: -61.11378232838799px; animation-delay: 1.46272s; animation-duration: 4.24468s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 85.4831%; --drift: -17.677436610661957px; animation-delay: 2.84049s; animation-duration: 5.62426s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="fire-particle" style="left: 16.1478%; --drift: -37.97807701286362px; animation-delay: 2.44694s; animation-duration: 4.74324s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 7.80125%; --drift: 109.89918794791018px; animation-delay: 0.0715409s; animation-duration: 5.65055s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 58.8754%; --drift: 110.72876224846256px; animation-delay: 2.01322s; animation-duration: 5.04146s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 96.4029%; --drift: -86.4074067736239px; animation-delay: 1.27062s; animation-duration: 4.61398s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="fire-particle" style="left: 43.0164%; --drift: 127.69602204258152px; animation-delay: 0.410401s; animation-duration: 4.08367s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 44.0945%; --drift: -88.77804126705034px; animation-delay: 0.865563s; animation-duration: 5.68515s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 36.3177%; --drift: 90.062339948679px; animation-delay: 0.0318162s; animation-duration: 5.51005s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 9.09258%; --drift: -149.86133177622997px; animation-delay: 1.67595s; animation-duration: 5.84276s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="fire-particle" style="left: 90.3568%; --drift: 139.03137776486048px; animation-delay: 0.337395s; animation-duration: 4.42115s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 25.0015%; --drift: -36.49834232825354px; animation-delay: 2.09911s; animation-duration: 5.46985s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 17.5889%; --drift: -85.2647659199027px; animation-delay: 1.70563s; animation-duration: 5.66311s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 44.259%; --drift: -121.9727933076615px; animation-delay: 2.16597s; animation-duration: 4.50742s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 30.697%; --drift: -75.5835818399261px; animation-delay: 2.08438s; animation-duration: 4.78808s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(255, 149, 0); width: 6px; height: 6px; --x: -34.951405530480734px; --y: -63.29441306470754px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(255, 255, 0); width: 6px; height: 6px; --x: -33.176213478929704px; --y: -5.595180866551935px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(255, 107, 53); width: 6px; height: 6px; --x: 24.72924835768888px; --y: 49.043680547391524px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(0, 245, 255); width: 6px; height: 6px; --x: -65.38650729660812px; --y: 20.479775298445414px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(255, 107, 53); width: 6px; height: 6px; --x: -1.7518969179286914px; --y: -0.7142533354090652px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(251, 86, 7); width: 6px; height: 6px; --x: -7.723734436423363px; --y: -47.18595470016444px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(255, 149, 0); width: 6px; height: 6px; --x: -21.96926446754985px; --y: -74.84359508600856px;"></div><div class="fire-burst" style="left: 334.316px; top: 149.485px; background: rgb(0, 255, 0); width: 6px; height: 6px; --x: -8.002805363619375px; --y: 62.931298050415116px;"></div><div class="fire-particle" style="left: 4.4008%; --drift: 130.01260964524937px; animation-delay: 2.83969s; animation-duration: 5.9901s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 99.5049%; --drift: 16.62399989061236px; animation-delay: 1.25447s; animation-duration: 5.70497s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="fire-particle" style="left: 43.3437%; --drift: -146.7099585812294px; animation-delay: 1.78012s; animation-duration: 5.865s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="rocket" style="left: 629.255px; top: 476px; --tx: -147.2914940962472px; --ty: -301.16076974533155px;">🚀</div><div class="fire-particle" style="left: 55.7642%; --drift: 4.274643289665924px; animation-delay: 0.592272s; animation-duration: 4.90934s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="fire-particle" style="left: 81.172%; --drift: -48.05106882418293px; animation-delay: 2.97869s; animation-duration: 5.87715s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 48.2717%; --drift: -37.67953945498406px; animation-delay: 0.878442s; animation-duration: 5.5756s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="fire-particle" style="left: 41.5399%; --drift: 23.03189553537679px; animation-delay: 0.83769s; animation-duration: 5.49796s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="fire-particle" style="left: 85.7838%; --drift: -70.3374490230404px; animation-delay: 0.528223s; animation-duration: 4.49538s; background: radial-gradient(circle, rgb(255, 107, 53), rgb(247, 147, 30));"></div><div class="rocket-trail" style="left: 577.703px; top: 370.594px; background: rgb(255, 149, 0);"></div><div class="fire-particle" style="left: 44.0067%; --drift: -5.430738443607696px; animation-delay: 0.87093s; animation-duration: 5.09886s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="rocket-trail" style="left: 570.339px; top: 355.536px; background: rgb(255, 94, 0);"></div><div class="fire-bubble" style="width: 20.0455px; height: 20.0455px; left: 459.5px; top: 2184px; background: rgb(255, 0, 110); --bx: 175.4073287235166px; --by: 0px; animation-delay: 0.197945s;"></div><div class="fire-bubble" style="width: 36.6638px; height: 36.6638px; left: 459.5px; top: 2184px; background: rgb(255, 61, 0); --bx: 200.29168447241557px; --by: 115.6384579465927px; animation-delay: 0.189045s;"></div><div class="fire-bubble" style="width: 32.3135px; height: 32.3135px; left: 459.5px; top: 2184px; background: rgb(247, 147, 30); --bx: 106.10263865040812px; --by: 183.7751609596281px; animation-delay: 0.115938s;"></div><div class="fire-bubble" style="width: 34.0665px; height: 34.0665px; left: 459.5px; top: 2184px; background: rgb(255, 94, 0); --bx: 1.1694150569342339e-14px; --by: 190.97997198023563px; animation-delay: 0.14583s;"></div><div class="fire-bubble" style="width: 28.6927px; height: 28.6927px; left: 459.5px; top: 2184px; background: rgb(255, 149, 0); --bx: -82.55386799797893px; --by: 142.987493733834px; animation-delay: 0.2489s;"></div><div class="fire-bubble" style="width: 29.8697px; height: 29.8697px; left: 459.5px; top: 2184px; background: rgb(255, 61, 0); --bx: -206.48230683097725px; --by: 119.2126154317596px; animation-delay: 0.172333s;"></div><div class="fire-bubble" style="width: 31.2763px; height: 31.2763px; left: 459.5px; top: 2184px; background: rgb(255, 190, 11); --bx: -126.06592638659028px; --by: 1.5438623323088365e-14px; animation-delay: 0.193233s;"></div><div class="fire-bubble" style="width: 37.6083px; height: 37.6083px; left: 459.5px; top: 2184px; background: rgb(255, 149, 0); --bx: -200.86166477256455px; --by: -115.96753622631655px; animation-delay: 0.0685026s;"></div><div class="fire-bubble" style="width: 36.8645px; height: 36.8645px; left: 459.5px; top: 2184px; background: rgb(255, 94, 0); --bx: -76.30791653407485px; --by: -132.16918845674266px; animation-delay: 0.0329798s;"></div><div class="fire-bubble" style="width: 22.1544px; height: 22.1544px; left: 459.5px; top: 2184px; background: rgb(255, 61, 0); --bx: -4.2965766100897706e-14px; --by: -233.89473672905606px; animation-delay: 0.00383798s;"></div><div class="fire-bubble" style="width: 15.4908px; height: 15.4908px; left: 459.5px; top: 2184px; background: rgb(255, 190, 11); --bx: 94.00141080324471px; --by: -162.81521949437376px; animation-delay: 0.00157483s;"></div><div class="fire-bubble" style="width: 21.7492px; height: 21.7492px; left: 459.5px; top: 2184px; background: rgb(255, 107, 53); --bx: 108.3530295238724px; --by: -62.55765076311927px; animation-delay: 0.0641258s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 0, 110); width: 14.524px; height: 14.524px; --x: -58.62215087490239px; --y: -88.53304837538852px; animation-delay: 0.0881112s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 61, 0); width: 9.68642px; height: 9.68642px; --x: -30.23296976413524px; --y: -22.07259579374432px; animation-delay: 0.0108002s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 107, 53); width: 11.8035px; height: 11.8035px; --x: -120.56305470109841px; --y: -127.09938370432712px; animation-delay: 0.077908s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(247, 147, 30); width: 8.9486px; height: 8.9486px; --x: -59.58405622105367px; --y: 38.59549799065679px; animation-delay: 0.0684926s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 190, 11); width: 14.7561px; height: 14.7561px; --x: -146.32634942686312px; --y: 76.03566264819294px; animation-delay: 0.0287194s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 107, 53); width: 14.3088px; height: 14.3088px; --x: -119.0202032309687px; --y: -106.86035813805763px; animation-delay: 0.185091s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(247, 147, 30); width: 9.35553px; height: 9.35553px; --x: -71.08515209526578px; --y: -64.80283526785672px; animation-delay: 0.050084s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 149, 0); width: 10.6201px; height: 10.6201px; --x: -132.33957269176125px; --y: 126.22162413076447px; animation-delay: 0.188634s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 149, 0); width: 9.67941px; height: 9.67941px; --x: 100.13703289454364px; --y: 32.697029975766114px; animation-delay: 0.0152642s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 107, 53); width: 7.0385px; height: 7.0385px; --x: 30.54058650105259px; --y: -115.99639535761543px; animation-delay: 0.166741s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(247, 147, 30); width: 9.8852px; height: 9.8852px; --x: 54.83096460050809px; --y: -87.96394218247995px; animation-delay: 0.173111s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(247, 147, 30); width: 12.7962px; height: 12.7962px; --x: 127.46590403117175px; --y: 36.268462282938984px; animation-delay: 0.0740246s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 94, 0); width: 8.22782px; height: 8.22782px; --x: 138.61957388490646px; --y: 51.78136948218188px; animation-delay: 0.0489225s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 190, 11); width: 14.792px; height: 14.792px; --x: -135.66785766334183px; --y: -5.023328615987587px; animation-delay: 0.0327492s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 61, 0); width: 12.1728px; height: 12.1728px; --x: 43.491302177656145px; --y: -111.22977012918352px; animation-delay: 0.114515s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 61, 0); width: 8.38877px; height: 8.38877px; --x: 80.04585772614583px; --y: 133.67984452439094px; animation-delay: 0.135998s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 61, 0); width: 14.8008px; height: 14.8008px; --x: 146.1439182439245px; --y: -86.64693156804653px; animation-delay: 0.0749537s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 94, 0); width: 6.81489px; height: 6.81489px; --x: 147.48706867134177px; --y: -106.03466171387782px; animation-delay: 0.0731547s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(251, 86, 7); width: 11.3709px; height: 11.3709px; --x: 146.68260652857037px; --y: 25.91456587147708px; animation-delay: 0.0966663s;"></div><div class="fire-burst" style="left: 459.5px; top: 2184px; background: rgb(255, 149, 0); width: 8.95882px; height: 8.95882px; --x: 118.007084894206px; --y: -10.802186773088119px; animation-delay: 0.0998084s;"></div><div class="rocket-trail" style="left: 562.974px; top: 340.478px; background: rgb(255, 190, 11);"></div><div class="fire-particle" style="left: 65.1072%; --drift: -41.701847436130976px; animation-delay: 0.184389s; animation-duration: 5.73758s; background: radial-gradient(circle, rgb(247, 147, 30), rgb(255, 190, 11));"></div><div class="rocket-trail" style="left: 555.61px; top: 325.42px; background: rgb(255, 0, 255);"></div><div class="fire-particle" style="left: 77.451%; --drift: -72.96308547379199px; animation-delay: 1.40184s; animation-duration: 5.40282s; background: radial-gradient(circle, rgb(255, 0, 110), rgb(255, 94, 0));"></div><div class="rocket-trail" style="left: 548.245px; top: 310.362px; background: rgb(251, 86, 7);"></div></body></html>
